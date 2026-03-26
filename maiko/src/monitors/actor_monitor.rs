@@ -1,6 +1,7 @@
-use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
+
+use dashmap::DashMap;
 
 use crate::{ActorId, Envelope, Event, OverflowPolicy, Topic, monitoring::Monitor};
 
@@ -20,13 +21,21 @@ use crate::{ActorId, Envelope, Event, OverflowPolicy, Topic, monitoring::Monitor
 /// ```
 #[derive(Clone)]
 pub struct ActorMonitor {
-    inner: Arc<Mutex<ActorMonitorInner>>,
+    actors: Arc<DashMap<ActorId, RwLock<ActorStats>>>,
 }
 
-struct ActorMonitorInner {
-    active: HashSet<ActorId>,
-    stopped: HashSet<ActorId>,
-    overflow_counts: HashMap<ActorId, usize>,
+struct ActorStats {
+    stopped: bool,
+    overflow_count: usize,
+}
+
+impl ActorStats {
+    fn new() -> Self {
+        Self {
+            stopped: false,
+            overflow_count: 0,
+        }
+    }
 }
 
 impl ActorMonitor {
@@ -34,44 +43,56 @@ impl ActorMonitor {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(ActorMonitorInner {
-                active: HashSet::new(),
-                stopped: HashSet::new(),
-                overflow_counts: HashMap::new(),
-            })),
+            actors: Arc::new(DashMap::new()),
         }
     }
 
     /// Returns a snapshot of currently active actor IDs.
     pub fn actors(&self) -> Vec<ActorId> {
-        let lock = self.inner.lock().unwrap();
-        lock.active.iter().cloned().collect()
+        self.actors
+            .iter()
+            .filter_map(|entry| {
+                let stats = entry.value().read().unwrap();
+                (!stats.stopped).then(|| entry.key().clone())
+            })
+            .collect()
     }
 
     /// Returns a snapshot of stopped actor IDs.
     pub fn stopped_actors(&self) -> Vec<ActorId> {
-        let lock = self.inner.lock().unwrap();
-        lock.stopped.iter().cloned().collect()
+        self.actors
+            .iter()
+            .filter_map(|entry| {
+                let stats = entry.value().read().unwrap();
+                stats.stopped.then(|| entry.key().clone())
+            })
+            .collect()
     }
 
     /// Returns `true` if the actor is currently active.
     pub fn is_alive(&self, actor: &ActorId) -> bool {
-        let lock = self.inner.lock().unwrap();
-        lock.active.contains(actor)
+        self.actors
+            .get(actor)
+            .map(|entry| !entry.value().read().unwrap().stopped)
+            .unwrap_or(false)
     }
 
     /// Returns `true` if the actor was registered and has since stopped.
     ///
     /// Returns `false` for actors that were never registered or are still active.
     pub fn is_stopped(&self, actor: &ActorId) -> bool {
-        let lock = self.inner.lock().unwrap();
-        lock.stopped.contains(actor)
+        self.actors
+            .get(actor)
+            .map(|entry| entry.value().read().unwrap().stopped)
+            .unwrap_or(false)
     }
 
     /// Returns the number of overflow events observed for this actor.
     pub fn overflow_count(&self, actor: &ActorId) -> usize {
-        let lock = self.inner.lock().unwrap();
-        lock.overflow_counts.get(actor).copied().unwrap_or(0)
+        self.actors
+            .get(actor)
+            .map(|entry| entry.value().read().unwrap().overflow_count)
+            .unwrap_or(0)
     }
 }
 
@@ -81,15 +102,21 @@ where
     T: Topic<E> + Send,
 {
     fn on_actor_registered(&self, actor_id: &ActorId) {
-        let mut lock = self.inner.lock().unwrap();
-        lock.active.insert(actor_id.clone());
-        lock.stopped.remove(actor_id);
+        let entry = self
+            .actors
+            .entry(actor_id.clone())
+            .or_insert_with(|| RwLock::new(ActorStats::new()));
+        let mut stats = entry.write().unwrap();
+        stats.stopped = false;
     }
 
     fn on_actor_stop(&self, actor_id: &ActorId) {
-        let mut lock = self.inner.lock().unwrap();
-        lock.active.remove(actor_id);
-        lock.stopped.insert(actor_id.clone());
+        let entry = self
+            .actors
+            .entry(actor_id.clone())
+            .or_insert_with(|| RwLock::new(ActorStats::new()));
+        let mut stats = entry.write().unwrap();
+        stats.stopped = true;
     }
 
     fn on_overflow(
@@ -99,8 +126,12 @@ where
         receiver: &ActorId,
         _policy: OverflowPolicy,
     ) {
-        let mut lock = self.inner.lock().unwrap();
-        *lock.overflow_counts.entry(receiver.clone()).or_insert(0) += 1;
+        let entry = self
+            .actors
+            .entry(receiver.clone())
+            .or_insert_with(|| RwLock::new(ActorStats::new()));
+        let mut stats = entry.write().unwrap();
+        stats.overflow_count += 1;
     }
 }
 
@@ -112,11 +143,17 @@ impl Default for ActorMonitor {
 
 impl fmt::Debug for ActorMonitor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let lock = self.inner.lock().unwrap();
+        let active = self.actors().len();
+        let stopped = self.stopped_actors().len();
+        let overflows = self
+            .actors
+            .iter()
+            .filter(|entry| entry.value().read().unwrap().overflow_count > 0)
+            .count();
         f.debug_struct("ActorMonitor")
-            .field("active", &lock.active.len())
-            .field("stopped", &lock.stopped.len())
-            .field("overflows", &lock.overflow_counts.len())
+            .field("active", &active)
+            .field("stopped", &stopped)
+            .field("overflows", &overflows)
             .finish()
     }
 }
