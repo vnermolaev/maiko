@@ -1,9 +1,27 @@
 use std::fmt;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use dashmap::DashMap;
 
-use crate::{ActorId, Envelope, Event, OverflowPolicy, Topic, monitoring::Monitor};
+use crate::{ActorId, Envelope, Event, OverflowPolicy, StepAction, Topic, monitoring::Monitor};
+
+/// Best-effort runtime state derived from lifecycle and `step()` callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorState {
+    /// Actor is registered/running without a more specific step-derived state.
+    Active,
+    /// Actor is currently executing `step()`.
+    Stepping,
+    /// Actor returned `StepAction::AwaitEvent`.
+    AwaitingEvent,
+    /// Actor returned `StepAction::Backoff`.
+    BackingOff(Duration),
+    /// Actor returned `StepAction::Never`.
+    StepDisabled,
+    /// Actor stop was observed.
+    Stopped,
+}
 
 /// Monitor that tracks actor lifecycle and per-actor event flow metrics.
 ///
@@ -23,6 +41,7 @@ use crate::{ActorId, Envelope, Event, OverflowPolicy, Topic, monitoring::Monitor
 /// let handled = query.handled_count(&actor_id);
 /// let errors = query.error_count(&actor_id);
 /// let depth = query.queue_depth(&actor_id);
+/// let state = query.state(&actor_id);
 /// ```
 #[derive(Clone)]
 pub struct ActorMonitor {
@@ -31,6 +50,7 @@ pub struct ActorMonitor {
 
 struct ActorStats {
     stopped: bool,
+    step_status: StepStatus,
     dispatched_count: usize,
     delivered_count: usize,
     handled_count: usize,
@@ -38,15 +58,41 @@ struct ActorStats {
     error_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepStatus {
+    /// No `step()` activity has been observed yet.
+    None,
+    /// The actor is currently executing `step()`.
+    InStep,
+    /// The most recent completed `step()` returned this action.
+    Last(StepAction),
+}
+
 impl ActorStats {
     fn new() -> Self {
         Self {
             stopped: false,
+            step_status: StepStatus::None,
             dispatched_count: 0,
             delivered_count: 0,
             handled_count: 0,
             overflow_count: 0,
             error_count: 0,
+        }
+    }
+
+    fn state(&self) -> ActorState {
+        if self.stopped {
+            ActorState::Stopped
+        } else {
+            match self.step_status {
+                StepStatus::None => ActorState::Active,
+                StepStatus::InStep => ActorState::Stepping,
+                StepStatus::Last(StepAction::AwaitEvent) => ActorState::AwaitingEvent,
+                StepStatus::Last(StepAction::Backoff(duration)) => ActorState::BackingOff(duration),
+                StepStatus::Last(StepAction::Never) => ActorState::StepDisabled,
+                StepStatus::Last(StepAction::Continue | StepAction::Yield) => ActorState::Active,
+            }
         }
     }
 }
@@ -153,6 +199,14 @@ impl ActorMonitor {
             })
             .unwrap_or(0)
     }
+
+    /// Returns the best-effort runtime state for this actor.
+    pub fn state(&self, actor: &ActorId) -> Option<ActorState> {
+        self.actors.get(actor).map(|entry| {
+            let stats = entry.value().read().unwrap();
+            stats.state()
+        })
+    }
 }
 
 impl<E, T> Monitor<E, T> for ActorMonitor
@@ -228,6 +282,24 @@ where
         let mut stats = entry.write().unwrap();
         stats.error_count += 1;
     }
+
+    fn on_step_enter(&self, actor_id: &ActorId) {
+        let entry = self
+            .actors
+            .entry(actor_id.clone())
+            .or_insert_with(|| RwLock::new(ActorStats::new()));
+        let mut stats = entry.write().unwrap();
+        stats.step_status = StepStatus::InStep;
+    }
+
+    fn on_step_exit(&self, step_action: &StepAction, actor_id: &ActorId) {
+        let entry = self
+            .actors
+            .entry(actor_id.clone())
+            .or_insert_with(|| RwLock::new(ActorStats::new()));
+        let mut stats = entry.write().unwrap();
+        stats.step_status = StepStatus::Last(*step_action);
+    }
 }
 
 impl Default for ActorMonitor {
@@ -272,6 +344,7 @@ mod tests {
         let m = ActorMonitor::default();
         assert!(m.actors().is_empty());
         assert!(m.stopped_actors().is_empty());
+        assert_eq!(m.state(&make_id("missing")), None);
     }
 
     #[test]
@@ -283,6 +356,7 @@ mod tests {
 
         assert!(monitor.is_alive(&a));
         assert!(monitor.actors().contains(&a));
+        assert_eq!(monitor.state(&a), Some(ActorState::Active));
     }
 
     #[test]
@@ -295,6 +369,7 @@ mod tests {
 
         assert!(!monitor.is_alive(&a));
         assert!(monitor.stopped_actors().contains(&a));
+        assert_eq!(monitor.state(&a), Some(ActorState::Stopped));
     }
 
     #[test]
@@ -367,6 +442,7 @@ mod tests {
         assert_eq!(monitor.dispatched_count(&a), 0);
         assert_eq!(monitor.delivered_count(&a), 1);
         assert_eq!(monitor.queue_depth(&a), 0);
+        assert_eq!(monitor.state(&a), Some(ActorState::Active));
     }
 
     #[test]
@@ -380,6 +456,7 @@ mod tests {
         assert_eq!(monitor.handled_count(&a), 0);
         assert_eq!(monitor.error_count(&a), 0);
         assert_eq!(monitor.queue_depth(&a), 0);
+        assert_eq!(monitor.state(&a), None);
     }
 
     #[test]
@@ -394,5 +471,54 @@ mod tests {
 
         assert!(query.is_alive(&a));
         assert_eq!(query.error_count(&a), 1);
+    }
+
+    #[test]
+    fn state_tracks_step_lifecycle() {
+        let monitor = ActorMonitor::new();
+        let a = make_id("actor-8");
+        let m: &dyn Monitor<TestEvent, DefaultTopic> = &monitor;
+
+        m.on_actor_registered(&a);
+        assert_eq!(monitor.state(&a), Some(ActorState::Active));
+
+        m.on_step_enter(&a);
+        assert_eq!(monitor.state(&a), Some(ActorState::Stepping));
+
+        m.on_step_exit(&StepAction::AwaitEvent, &a);
+        assert_eq!(monitor.state(&a), Some(ActorState::AwaitingEvent));
+
+        m.on_step_enter(&a);
+        m.on_step_exit(&StepAction::Backoff(Duration::from_millis(5)), &a);
+        assert_eq!(
+            monitor.state(&a),
+            Some(ActorState::BackingOff(Duration::from_millis(5)))
+        );
+
+        m.on_step_enter(&a);
+        m.on_step_exit(&StepAction::Never, &a);
+        assert_eq!(monitor.state(&a), Some(ActorState::StepDisabled));
+
+        m.on_step_enter(&a);
+        m.on_step_exit(&StepAction::Continue, &a);
+        assert_eq!(monitor.state(&a), Some(ActorState::Active));
+
+        m.on_step_enter(&a);
+        m.on_step_exit(&StepAction::Yield, &a);
+        assert_eq!(monitor.state(&a), Some(ActorState::Active));
+    }
+
+    #[test]
+    fn stopped_state_overrides_last_step_action() {
+        let monitor = ActorMonitor::new();
+        let a = make_id("actor-9");
+        let m: &dyn Monitor<TestEvent, DefaultTopic> = &monitor;
+
+        m.on_actor_registered(&a);
+        m.on_step_enter(&a);
+        m.on_step_exit(&StepAction::AwaitEvent, &a);
+        m.on_actor_stop(&a);
+
+        assert_eq!(monitor.state(&a), Some(ActorState::Stopped));
     }
 }

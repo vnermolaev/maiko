@@ -94,6 +94,7 @@ query.delivered_count(&actor_id);
 query.handled_count(&actor_id);
 query.error_count(&actor_id);
 query.queue_depth(&actor_id);
+query.state(&actor_id);
 query.actors();          // snapshot of active actor IDs
 query.stopped_actors();  // snapshot of stopped actor IDs
 ```
