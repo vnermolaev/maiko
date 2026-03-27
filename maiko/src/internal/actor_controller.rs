@@ -1,3 +1,4 @@
+use std::future;
 use std::sync::Arc;
 
 use tokio::{
@@ -28,22 +29,46 @@ pub(crate) struct ActorController<A: Actor, T: Topic<A::Event>> {
 
 impl<A: Actor, T: Topic<A::Event>> ActorController<A, T> {
     pub async fn run(&mut self) -> Result {
+        // `select!` decides what should happen next without running actor work
+        // directly inside branch futures. The selected action is executed below
+        // in ordinary sequential code, which keeps borrow scopes simple.
+        enum Next<E> {
+            Continue,
+            Stop,
+            HandleEvent(Arc<Envelope<E>>),
+            RunStep { clear_backoff: bool },
+        }
+
         self.actor.on_start().await?;
         let mut step_handler = StepHandler::default();
         loop {
-            select! {
+            let next = select! {
                 biased;
 
                 cmd_res = self.command_rx.recv() => match cmd_res {
                     Ok(cmd) => match cmd {
-                        Command::StopActor(ref id) if id == self.ctx.actor_id() => break,
-                        Command::StopRuntime => break,
-                        _ => {}
+                        Command::StopActor(ref id) if id == self.ctx.actor_id() => Next::Stop,
+                        Command::StopRuntime => Next::Stop,
+                        _ => Next::Continue,
                     }
-                    Err(e) => return Err(Error::internal(e))
+                    Err(e) => return Err(Error::internal(e)),
                 },
 
-                Some(event) = self.receiver.recv() => {
+                Some(event) = self.receiver.recv() => Next::HandleEvent(event),
+
+                _ = async {
+                    if let Some(backoff_sleep) = step_handler.backoff.as_mut() {
+                        backoff_sleep.as_mut().await;
+                    }
+                }, if step_handler.is_delayed() => Next::RunStep { clear_backoff: true },
+
+                _ = future::ready(()), if step_handler.can_step() => Next::RunStep { clear_backoff: false },
+            };
+
+            match next {
+                Next::Continue => continue,
+                Next::Stop => break,
+                Next::HandleEvent(event) => {
                     self.handle_incoming_event(event).await?;
 
                     let mut cnt = 1;
@@ -58,13 +83,11 @@ impl<A: Actor, T: Topic<A::Event>> ActorController<A, T> {
                         step_handler.pause = StepPause::None;
                     }
                 }
-
-                _ = async {
-                    if let Some(backoff_sleep) = step_handler.backoff.as_mut() {
-                        backoff_sleep.as_mut().await;
+                Next::RunStep { clear_backoff } => {
+                    if clear_backoff {
+                        let _ = step_handler.backoff.take();
                     }
-                }, if step_handler.is_delayed() => {
-                    let _ = step_handler.backoff.take();
+
                     match self.actor.step().await {
                         Ok(action) => handle_step_action(action, &mut step_handler).await,
                         Err(e) => {
@@ -74,20 +97,7 @@ impl<A: Actor, T: Topic<A::Event>> ActorController<A, T> {
                             self.actor.on_error(e)?;
                             step_handler.reset();
                         }
-                     }
-                }
-
-                res = self.actor.step(), if step_handler.can_step() => {
-                     match res {
-                        Ok(action) => handle_step_action(action, &mut step_handler).await,
-                        Err(e) => {
-                            #[cfg(feature = "monitoring")]
-                            self.notify_error(&e);
-
-                            self.actor.on_error(e)?;
-                            step_handler.reset();
-                        }
-                     }
+                    }
                 }
             }
         }
