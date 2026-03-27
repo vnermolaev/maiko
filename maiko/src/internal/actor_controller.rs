@@ -88,8 +88,16 @@ impl<A: Actor, T: Topic<A::Event>> ActorController<A, T> {
                         let _ = step_handler.backoff.take();
                     }
 
+                    #[cfg(feature = "monitoring")]
+                    self.notify_step_enter();
+
                     match self.actor.step().await {
-                        Ok(action) => handle_step_action(action, &mut step_handler).await,
+                        Ok(action) => {
+                            #[cfg(feature = "monitoring")]
+                            self.notify_step_exit(action);
+
+                            handle_step_action(action, &mut step_handler).await
+                        }
                         Err(e) => {
                             #[cfg(feature = "monitoring")]
                             self.notify_error(&e);
@@ -199,6 +207,24 @@ impl<A: Actor, T: Topic<A::Event>> ActorController<A, T> {
                 .send(MonitoringEvent::ActorStopped(self.ctx.actor_id().clone()));
         }
     }
+
+    #[inline]
+    fn notify_step_enter(&self) {
+        if self.monitoring.is_active() {
+            self.monitoring
+                .send(MonitoringEvent::StepEnter(self.ctx.actor_id().clone()));
+        }
+    }
+
+    #[inline]
+    fn notify_step_exit(&self, step_action: StepAction) {
+        if self.monitoring.is_active() {
+            self.monitoring.send(MonitoringEvent::StepExit(
+                step_action,
+                self.ctx.actor_id().clone(),
+            ));
+        }
+    }
 }
 
 #[cfg(all(test, feature = "test-harness"))]
@@ -297,5 +323,110 @@ mod tests {
         sup.stop().await?;
 
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "monitoring"))]
+mod monitoring_tests {
+    //! Monitoring-specific regression tests for [`crate::internal::ActorController`].
+    //!
+    //! These cover runtime signals that are only emitted when the
+    //! `monitoring` feature is enabled, such as step enter/exit callbacks.
+
+    use crate::{
+        Actor, ActorId, DefaultTopic, Envelope, Event, StepAction, Subscribe, Supervisor,
+        monitoring::Monitor,
+    };
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    use tokio::time;
+
+    #[derive(Clone, Debug)]
+    struct TestEvent;
+    impl Event for TestEvent {}
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum StepRecord {
+        Enter(ActorId),
+        Exit(StepAction, ActorId),
+    }
+
+    struct StepMonitor {
+        records: Arc<Mutex<Vec<StepRecord>>>,
+    }
+
+    impl Monitor<TestEvent, DefaultTopic> for StepMonitor {
+        fn on_step_enter(&self, actor_id: &ActorId) {
+            self.records
+                .lock()
+                .unwrap()
+                .push(StepRecord::Enter(actor_id.clone()));
+        }
+
+        fn on_step_exit(&self, step_action: &StepAction, actor_id: &ActorId) {
+            self.records
+                .lock()
+                .unwrap()
+                .push(StepRecord::Exit(*step_action, actor_id.clone()));
+        }
+    }
+
+    struct BackoffThenAwaitActor {
+        steps: usize,
+    }
+
+    impl Actor for BackoffThenAwaitActor {
+        type Event = TestEvent;
+
+        async fn handle_event(&mut self, _event: &Envelope<Self::Event>) -> crate::Result {
+            Ok(())
+        }
+
+        async fn step(&mut self) -> crate::Result<StepAction> {
+            self.steps += 1;
+            Ok(match self.steps {
+                1 => StepAction::Backoff(Duration::from_millis(1)),
+                _ => StepAction::AwaitEvent,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_monitoring_emits_step_enter_and_exit() -> crate::Result<()> {
+        let mut sup = Supervisor::<TestEvent>::default();
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let handle = sup
+            .monitors()
+            .add(StepMonitor {
+                records: records.clone(),
+            })
+            .await;
+
+        sup.add_actor(
+            "stepper",
+            |_| BackoffThenAwaitActor { steps: 0 },
+            Subscribe::none(),
+        )?;
+        sup.start().await?;
+
+        time::sleep(Duration::from_millis(10)).await;
+        handle.flush(Duration::from_millis(1)).await;
+
+        let stepper = ActorId::new("stepper");
+        let expected = vec![
+            StepRecord::Enter(stepper.clone()),
+            StepRecord::Exit(
+                StepAction::Backoff(Duration::from_millis(1)),
+                stepper.clone(),
+            ),
+            StepRecord::Enter(stepper.clone()),
+            StepRecord::Exit(StepAction::AwaitEvent, stepper),
+        ];
+
+        assert_eq!(*records.lock().unwrap(), expected);
+
+        sup.stop().await
     }
 }
